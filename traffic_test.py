@@ -10,7 +10,6 @@ CSV_PATH = "ML-MATT-CompetitionQT2021_test.csv"
 
 FEATURE_COLS = [
     "PRBUsageUL",
-    "PRBUsageDL",
     "meanThr_DL",
     "meanThr_UL",
     "maxThr_DL",
@@ -26,73 +25,198 @@ TARGET_COLS = ["PRBUsageDL"]
 
 # ============================================================
 # ①-보조 Sliding Window Dataset
-# - 과거 window=12개의 KPI sequence를 입력 X로 사용한다.
-# - 다음 시점의 PRBUsageDL을 정답 y로 사용한다.
-# - 즉:
-#     X = [t-11, t-10, ..., t]
-#     y = [t+1의 PRBUsageDL]
-# - 논문 실험 설정의 "previous 12 time steps → next time step prediction"에 해당한다.
+# - CellName별 고정 시간 Grid에서 생성된 sequence만 사용
+# - window=12이면 15분 grid 기준 과거 3시간
+# - 1시간 단위로 쓰려면 freq="60min", window=12 → 과거 12시간
 # ============================================================
 class SequenceDataset(Dataset):
-    def __init__(self, x, y, window=12):
+    def __init__(self, x, y, cell_ids, window=12):
         self.x = torch.tensor(x, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
+        self.cell_ids = np.asarray(cell_ids)
         self.window = window
 
+        self.indices = []
+        for i in range(0, len(self.x) - window):
+            # 같은 CellName 내부에서만 sliding window 허용
+            if self.cell_ids[i] == self.cell_ids[i + window]:
+                self.indices.append(i)
+
     def __len__(self):
-        return len(self.x) - self.window
+        return len(self.indices)
 
     def __getitem__(self, idx):
+        i = self.indices[idx]
         return (
-            self.x[idx:idx + self.window],
-            self.y[idx + self.window]
+            self.x[i:i + self.window],
+            self.y[i + self.window]
         )
-
+    
 # ============================================================
 # ① 전처리 Preprocessing
-# - CSV 파일을 읽는다.
-# - Time, CellName 기준으로 정렬한다.
-# - feature vector를 만든다.
-# - train/valid/test를 시간 순서대로 70/20/10 분할한다.
-# - train set 기준 평균(mean), 표준편차(std)로 정규화한다.
-# - 논문 식 (6): (x - μ) / sqrt(σ² + ε)에 해당한다.
-# - 목적:
-#   서로 다른 KPI 수치 범위를 평균 0, 분산 1 수준으로 맞춰
-#   특정 feature가 학습을 지배하지 않도록 한다.
+# ------------------------------------------------------------
+# 목적:
+# 기존 코드의 "단순 행(row) 기준 12개 자르기" 문제를 제거하고,
+# 실제 시계열 데이터 구조에 맞게 CellName별 고정 시간축(Grid)을 생성한다.
+#
+# 핵심 개선점:
+# 1) CellName별 독립 시계열 구성
+#    - 서로 다른 기지국/셀 데이터를 섞지 않는다.
+#
+# 2) 고정 시간 Grid 생성
+#    - freq="15min"이면:
+#      00:00, 00:15, 00:30 ... 23:45
+#    - freq="60min"이면:
+#      00:00, 01:00, 02:00 ... 23:00
+#
+# 3) 누락 시간대 보정
+#    - 실제 데이터셋은 특정 시간 슬롯이 비어 있을 수 있다.
+#    - reindex 후 선형보간(interpolation) 수행
+#    - 남은 결측치는 Cell 평균값으로 대체
+#    - 최종적으로 남으면 0 처리
+#
+# 4) 시간 순서 기반 train / valid / test 분할
+#    - 전체 데이터를 미래 누수 없이 앞에서부터
+#      70% / 20% / 10% 분할한다.
+#
+# 5) 논문 식 (6) 정규화 적용
+#    x_norm = (x - μ) / sqrt(σ² + ε)
+#
+#    여기서:
+#      μ  = train set feature 평균
+#      σ² = train set feature 분산
+#      ε  = 0으로 나누기 방지 상수
+#
+#    train 통계량만 사용하여 valid/test 변환
+#    → Data Leakage 방지
+#
+# 입력:
+#   path : CSV 경로
+#   freq : 시간 Grid 간격
+#          "15min" / "30min" / "60min" 등
+#   eps  : 안정화 상수
+#
+# 출력:
+#   x_train, y_train, cell_train
+#   x_valid, y_valid, cell_valid
+#   x_test , y_test , cell_test
+#
+# 사용 예:
+#   load_data(path, freq="15min")
+#   → 12-step window = 과거 3시간
+#
+#   load_data(path, freq="60min")
+#   → 12-step window = 과거 12시간
 # ============================================================
-def load_data(path):
+def load_data(path, freq="15min", eps=1e-8):
     df = pd.read_csv(path, sep=";")
 
-    df["Time"] = pd.to_datetime(df["Time"], format="%H:%M").dt.hour * 60 + \
-                 pd.to_datetime(df["Time"], format="%H:%M").dt.minute
+    # Time 문자열을 datetime time index로 변환
+    df["TimeDT"] = pd.to_datetime(df["Time"], format="%H:%M")
 
-    df = df.sort_values(["CellName", "Time"]).reset_index(drop=True)
+    # 숫자 컬럼 안전 변환
+    for col in FEATURE_COLS + TARGET_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    x = df[FEATURE_COLS].values.astype(np.float32)
-    y = df[TARGET_COLS].values.astype(np.float32)
+    # 같은 CellName, 같은 Time이 여러 개 있으면 평균 집계
+    df = (
+        df.groupby(["CellName", "TimeDT"], as_index=False)[FEATURE_COLS + TARGET_COLS]
+          .mean()
+    )
 
-    n = len(df)
+    # --------------------------------------------------------
+    # CellName별 고정 시간 Grid 생성
+    # 예: freq="15min"
+    # 00:00, 00:15, 00:30, ..., 23:45
+    # --------------------------------------------------------
+    full_frames = []
+
+    base_day = "1900-01-01"
+    full_grid = pd.date_range(
+        f"{base_day} 00:00",
+        f"{base_day} 23:45",
+        freq=freq
+    )
+
+    for cell, g in df.groupby("CellName"):
+        g = g.sort_values("TimeDT").copy()
+
+        # 날짜를 base_day로 통일
+        g["TimeDT"] = pd.to_datetime(
+            base_day + " " + g["TimeDT"].dt.strftime("%H:%M")
+        )
+
+        g = g.set_index("TimeDT")
+
+        # 고정 Grid로 재색인
+        g = g.reindex(full_grid)
+
+        g["CellName"] = cell
+        g["TimeDT"] = full_grid
+
+        # 결측치 처리
+        # 1) 같은 Cell 내부 앞/뒤 값으로 보간
+        # 2) 그래도 비어 있으면 해당 Cell 평균
+        # 3) 그래도 비어 있으면 0
+        g[FEATURE_COLS + TARGET_COLS] = (
+            g[FEATURE_COLS + TARGET_COLS]
+            .interpolate(method="linear", limit_direction="both")
+        )
+
+        g[FEATURE_COLS + TARGET_COLS] = (
+            g[FEATURE_COLS + TARGET_COLS]
+            .fillna(g[FEATURE_COLS + TARGET_COLS].mean())
+            .fillna(0.0)
+        )
+
+        full_frames.append(g.reset_index(drop=True))
+
+    df_grid = pd.concat(full_frames, ignore_index=True)
+
+    # 최종 정렬
+    df_grid = df_grid.sort_values(["CellName", "TimeDT"]).reset_index(drop=True)
+
+    # CellName 보존용 ID
+    cell_ids = df_grid["CellName"].values
+
+    x = df_grid[FEATURE_COLS].values.astype(np.float32)
+    y = df_grid[TARGET_COLS].values.astype(np.float32)
+
+    n = len(df_grid)
     train_end = int(n * 0.7)
     valid_end = int(n * 0.9)
 
     x_train, x_valid, x_test = x[:train_end], x[train_end:valid_end], x[valid_end:]
     y_train, y_valid, y_test = y[:train_end], y[train_end:valid_end], y[valid_end:]
 
-    mean = x_train.mean(axis=0, keepdims=True)
-    std = x_train.std(axis=0, keepdims=True) + 1e-8
+    cell_train = cell_ids[:train_end]
+    cell_valid = cell_ids[train_end:valid_end]
+    cell_test = cell_ids[valid_end:]
 
-    x_train = (x_train - mean) / std
-    x_valid = (x_valid - mean) / std
-    x_test = (x_test - mean) / std
+    # --------------------------------------------------------
+    # 논문 식 (6)
+    # LN(x) = (x - μ) / sqrt(σ² + ε)
+    # 여기서는 feature normalization에 적용
+    # --------------------------------------------------------
+    mean = x_train.mean(axis=0, keepdims=True)
+    var = x_train.var(axis=0, keepdims=True)
+
+    x_train = (x_train - mean) / np.sqrt(var + eps)
+    x_valid = (x_valid - mean) / np.sqrt(var + eps)
+    x_test = (x_test - mean) / np.sqrt(var + eps)
 
     y_mean = y_train.mean(axis=0, keepdims=True)
-    y_std = y_train.std(axis=0, keepdims=True) + 1e-8
+    y_var = y_train.var(axis=0, keepdims=True)
 
-    y_train = (y_train - y_mean) / y_std
-    y_valid = (y_valid - y_mean) / y_std
-    y_test = (y_test - y_mean) / y_std
+    y_train = (y_train - y_mean) / np.sqrt(y_var + eps)
+    y_valid = (y_valid - y_mean) / np.sqrt(y_var + eps)
+    y_test = (y_test - y_mean) / np.sqrt(y_var + eps)
 
-    return x_train, y_train, x_valid, y_valid, x_test, y_test
+    return (
+        x_train, y_train, cell_train,
+        x_valid, y_valid, cell_valid,
+        x_test, y_test, cell_test
+    )
 
 # ============================================================
 # ② MFE: Multi-head Self-Attention
@@ -405,12 +529,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ① 데이터 로드 및 정규화
-    x_train, y_train, x_valid, y_valid, x_test, y_test = load_data(CSV_PATH)
+    x_train, y_train, cell_train, \
+    x_valid, y_valid, cell_valid, \
+    x_test, y_test, cell_test = load_data(CSV_PATH, freq="15min")
 
     # ① Sliding window dataset 생성
-    train_ds = SequenceDataset(x_train, y_train)
-    valid_ds = SequenceDataset(x_valid, y_valid)
-    test_ds = SequenceDataset(x_test, y_test)
+    train_ds = SequenceDataset(x_train, y_train, cell_train, window=12)
+    valid_ds = SequenceDataset(x_valid, y_valid, cell_valid, window=12)
+    test_ds = SequenceDataset(x_test, y_test, cell_test, window=12)
 
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
     valid_loader = DataLoader(valid_ds, batch_size=64, shuffle=False)
